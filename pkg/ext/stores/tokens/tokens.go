@@ -4,7 +4,6 @@ import (
 	ext "github.com/rancher/rancher/pkg/apis/ext.cattle.io/v1"
 	extcore "github.com/rancher/steve/pkg/ext"
 
-	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -16,11 +15,10 @@ import (
 	"github.com/rancher/rancher/pkg/wrangler"
 	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/randomtoken"
-	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	authzv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 )
 
 const (
@@ -31,13 +29,20 @@ const (
 
 // +k8s:openapi-gen=false
 // +k8s:deepcopy-gen=false
+
+// TokenStore is the interface to the token store seen by the extension API and users. Wrapped
+// around a SystemTokenStore it performs the necessary checks to ensure that Users have only access
+// to the tokens they are permitted to.
 type TokenStore struct {
 	SystemTokenStore
-	sar authzv1.SubjectAccessReviewInterface
 }
 
 // +k8s:openapi-gen=false
 // +k8s:deepcopy-gen=false
+
+// SystemTokenStore is the interface to the token store used internally by other parts of
+// rancher. It does not perform any kind of permission checks, and operates with (implied) admin
+// authority. IOW it has access to all the tokens, in all ways.
 type SystemTokenStore struct {
 	secretClient        v1.SecretClient
 	userAttributeClient v3.UserAttributeClient
@@ -50,7 +55,6 @@ type SystemTokenStore struct {
 func NewTokenStoreFromWrangler(wranglerContext *wrangler.Context) extcore.Store[*ext.Token, *ext.TokenList] {
 	return NewTokenStore(
 		wranglerContext.Core.Secret(),
-		wranglerContext.K8s.AuthorizationV1().SubjectAccessReviews(),
 		wranglerContext.Mgmt.UserAttribute(),
 		wranglerContext.Mgmt.User(),
 	)
@@ -58,7 +62,6 @@ func NewTokenStoreFromWrangler(wranglerContext *wrangler.Context) extcore.Store[
 
 func NewTokenStore(
 	secretClient v1.SecretClient,
-	sar authzv1.SubjectAccessReviewInterface,
 	uaClient v3.UserAttributeController,
 	userClient v3.UserController,
 ) extcore.Store[*ext.Token, *ext.TokenList] {
@@ -69,7 +72,6 @@ func NewTokenStore(
 			userClient:          userClient,
 			events:              make(chan extcore.WatchEvent[*ext.Token], 100),
 		},
-		sar: sar,
 	}
 	return &tokenStore
 }
@@ -414,25 +416,18 @@ func (t *SystemTokenStore) Delete(name string, opts *metav1.DeleteOptions) error
 }
 
 func (t *TokenStore) userHasManageTokenPermissions(ctx extcore.Context) (bool, error) {
-	sar := &authv1.SubjectAccessReview{
-		Spec: authv1.SubjectAccessReviewSpec{
-			User:   ctx.User.GetName(),
-			Groups: ctx.User.GetGroups(),
-			UID:    ctx.User.GetUID(),
-			ResourceAttributes: &authv1.ResourceAttributes{
-				Verb:     "manage-token",
-				Resource: "tokens",
-				Group:    "ext.cattle.io",
-			},
-		},
-	}
-	sarctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-	sar, err := t.sar.Create(sarctx, sar, metav1.CreateOptions{})
+	decision, _, err := ctx.Authorizer.Authorize(ctx, authorizer.AttributesRecord{
+		User:            ctx.User,
+		Verb:            "manage-token",
+		Resource:        "tokens",
+		ResourceRequest: true,
+		APIGroup:        "ext.cattle.io",
+	})
 	if err != nil {
-		return false, fmt.Errorf("unable to create SAR: %w", err)
+		return false, err
 	}
-	return sar.Status.Allowed, nil
+
+	return decision == authorizer.DecisionAllow, nil
 }
 
 // Internal supporting functionality
